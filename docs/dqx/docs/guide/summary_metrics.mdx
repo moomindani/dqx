@@ -30,7 +30,7 @@ DQX automatically captures the following built-in metrics for every data quality
 | `error_row_count`        | `int`                                           | Number of rows that failed error-level checks                       |
 | `warning_row_count`      | `int`                                           | Number of rows that triggered warning-level checks                  |
 | `valid_row_count`        | `int`                                           | Number of rows that passed all checks (have no errors and warnings) |
-| `check_metrics`          | `string` (JSON)                                 | Per-check breakdown of error and warning counts, stored as a JSON array of structs: `[{"check_name": "...", "error_count": N, "warning_count": N}, ...]`. Automatically included when checks are applied. |
+| `check_metrics`          | `string` (JSON)                                 | Per-check breakdown of error and warning counts, stored as a JSON array of structs: `[{"check_name": "...", "rule_fingerprint": "...", "error_count": N, "warning_count": N, "user_metadata": {...}}, ...]`. Automatically included when checks are applied. |
 
 ### Per-Check Metrics
 
@@ -46,16 +46,25 @@ The `check_metrics` value is a JSON-serialized array of structs, with one entry 
 
 ```json
 [
-  {"check_name": "id_is_not_null", "error_count": 5, "warning_count": 0},
-  {"check_name": "name_is_not_null_and_not_empty", "error_count": 0, "warning_count": 3},
-  {"check_name": "passenger_incorrect_count", "error_count": 0, "warning_count": 0}
+  {"check_name": "id_is_not_null", "rule_fingerprint": "c7cdc9ef...", "error_count": 5, "warning_count": 0, "user_metadata": {"owner": "data-eng", "team": "ingest"}},
+  {"check_name": "name_is_not_null_and_not_empty", "rule_fingerprint": "9a1f20b3...", "error_count": 0, "warning_count": 3},
+  {"check_name": "passenger_incorrect_count", "rule_fingerprint": "4e08db77...", "error_count": 0, "warning_count": 0}
 ]
 ```
 
 Each entry contains:
 - `check_name` — the name of the check (either explicitly set via `name` in the rule definition, or auto-derived from the check function and arguments)
+- `rule_fingerprint` — SHA-256 fingerprint of the rule. The stable identifier for a check, so entries stay distinguishable when two rules share a name
 - `error_count` — number of rows where this check triggered an error (`0` if no rows failed the check)
 - `warning_count` — number of rows where this check triggered a warning (`0` if no rows failed the check)
+- `user_metadata` — the rule's own `user_metadata`, present only when the rule sets it. Distinct from the run-level `user_metadata` (from `ExtraParams`), which is a column on the metrics table rather than a field here
+
+<Admonition type="tip" title="Attributing a failing check to its owner">
+Because each entry carries the rule's `user_metadata`, a monitoring query or SQL alert can attribute a
+failing check to its owner or team directly, with no join back to the check definitions. Where such a
+join is still needed, `rule_fingerprint` is the key to use — joining on `check_name` alone is ambiguous
+when names are reused.
+</Admonition>
 
 When persisted to the metrics table, `check_metrics` is stored as a single row with `metric_name = 'check_metrics'` and `metric_value` containing the JSON string. You can parse it with Spark's `from_json` or `json_tuple` functions for analysis:
 
@@ -63,14 +72,23 @@ When persisted to the metrics table, `check_metrics` is stored as a single row w
 SELECT
   run_id,
   check.check_name,
+  check.rule_fingerprint,
   check.error_count,
-  check.warning_count
+  check.warning_count,
+  check.user_metadata
 FROM main.analytics.dq_metrics
 LATERAL VIEW explode(
-  from_json(metric_value, 'array<struct<check_name:string,error_count:bigint,warning_count:bigint>>')
+  from_json(metric_value, 'array<struct<check_name:string,rule_fingerprint:string,error_count:bigint,warning_count:bigint,user_metadata:map<string,string>>>')
 ) AS check
 WHERE metric_name = 'check_metrics'
 ```
+
+<Admonition type="warning" title="Keep the from_json schema in sync">
+`from_json` silently returns `null` for any field missing from the schema you pass, so a schema that
+omits a field drops it without error. Conversely, listing a field that a given row does not carry — such
+as `user_metadata` on a check that sets none — simply yields `null` for that row, so the schema above is
+safe to use against a mix of old and new metrics rows.
+</Admonition>
 
 ### Custom Metrics
 
@@ -508,7 +526,8 @@ If you prefer time-windowed metrics, add a watermark on a timestamp column and a
     import pyspark.sql.functions as F
     from databricks.labs.dqx.metrics_observer import DQMetricsObserver
 
-    # pass check names to get_metrics(check_names) to also include the per-check breakdown
+    # pass the applied checks to get_metrics(checks) to also include the per-check breakdown;
+    # entries may be check names, or DQCheckMetadata to also report rule_fingerprint and user_metadata
     observer = DQMetricsObserver()
 
     @dlt.table
@@ -660,7 +679,7 @@ Summary metrics can be written and centralized in a delta table. The metrics tab
 | `checks_location`     | `STRING`              | Location where checks are stored (table name or file path), if known.                                                                                                                                                                                                                                                                                                    |
 | `rule_set_fingerprint`| `STRING`              | SHA-256 fingerprint of the rule set used for this run. Enables correlation with checks storage and results. Populated automatically when applying checks or saving results.                                                                                                                                                                                              |
 | `metric_name`         | `STRING`              | Name of the metric (e.g., 'input_row_count').                                                                                                                                                                                                                                                                                                                            |
-| `metric_value`        | `STRING`              | Value of the metric. All values are stored as strings — numeric metrics (e.g. `input_row_count`) are string-encoded integers, and `check_metrics` is a JSON string: `[{"check_name": "...", "error_count": N, "warning_count": N}, ...]`. Cast to the appropriate type when querying (e.g. `CAST(metric_value AS INT)` for counts, or parse JSON for `check_metrics`).    |
+| `metric_value`        | `STRING`              | Value of the metric. All values are stored as strings — numeric metrics (e.g. `input_row_count`) are string-encoded integers, and `check_metrics` is a JSON string: `[{"check_name": "...", "rule_fingerprint": "...", "error_count": N, "warning_count": N, "user_metadata": {...}}, ...]`. Cast to the appropriate type when querying (e.g. `CAST(metric_value AS INT)` for counts, or parse JSON for `check_metrics`).    |
 | `run_time`            | `TIMESTAMP`           | Run timestamp when the summary metrics were calculated.                                                                                                                                                                                                                                                                                                                  |
 | `error_column_name`   | `STRING`              | Name of the error column in the output or quarantine table containing per row quality checking results (default: '_errors').                                                                                                                                                                                                                                             |
 | `warning_column_name` | `STRING`              | Name of the warning column in the output or quarantine table containing per row quality checking results (default: '_warnings').                                                                                                                                                                                                                                         |

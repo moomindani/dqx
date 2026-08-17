@@ -701,10 +701,24 @@ def _run_dryrun_sql_check(
         )
 
         # SQL checks treat each violation row as one error against a single
-        # logical "check" (criticality 'error' by convention).
-        synth_check_metrics = _json_dumps(
-            [{"check_name": str(check_name), "error_count": invalid_rows, "warning_count": 0}]
-        )
+        # logical "check" (criticality 'error' by convention). ``user_metadata``
+        # mirrors what ``DQMetricsObserver`` emits so both producers write one
+        # shape into the shared metrics table.
+        #
+        # ``rule_fingerprint`` is deliberately omitted: this entry is synthesised
+        # for a cross-table SQL check rather than taken from a DQRule, so a
+        # fingerprint computed here would not match the one the checks table
+        # stores. An absent field is unambiguous; a mismatched one would send
+        # anyone joining on it to the wrong rule.
+        synth_entry: dict[str, Any] = {
+            "check_name": str(check_name),
+            "error_count": invalid_rows,
+            "warning_count": 0,
+        }
+        synth_user_metadata = checks[0].get("user_metadata") if checks else None
+        if synth_user_metadata:
+            synth_entry["user_metadata"] = synth_user_metadata
+        synth_check_metrics = _json_dumps([synth_entry])
         observed = {
             "input_row_count": str(total_rows),
             "error_row_count": str(invalid_rows),

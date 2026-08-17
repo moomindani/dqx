@@ -1,4 +1,5 @@
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
@@ -14,6 +15,35 @@ OBSERVATION_TABLE_SCHEMA = (
     "checks_location string, rule_set_fingerprint string, metric_name string, metric_value string, run_time timestamp, "
     "error_column_name string, warning_column_name string, user_metadata map<string, string>"
 )
+
+
+@dataclass(frozen=True)
+class DQCheckMetadata:
+    """Per-check metadata reported in the *check_metrics* summary metric.
+
+    Deliberately decoupled from *DQRule*: the observer needs only these three values, and taking a
+    plain value object keeps it independent of the rule model (and testable without check functions).
+
+    Args:
+        name: Check name, as recorded in the *_errors* / *_warnings* result structs.
+        rule_fingerprint: (optional) SHA-256 fingerprint of the rule. The stable identifier for a
+            check, which disambiguates entries when two rules share a name.
+        user_metadata: (optional) Rule-level user metadata. Distinct from the run-level
+            *ExtraParams.user_metadata* already persisted as a column on the metrics table.
+    """
+
+    name: str
+    rule_fingerprint: str | None = None
+    user_metadata: dict[str, Any] | None = None
+
+
+def _compact_json(value: Any) -> str:
+    """JSON-encode *value* without the whitespace json.dumps inserts by default.
+
+    Keys are sorted so the emitted metric is deterministic across runs, which matters because
+    *check_metrics* is compared verbatim in tests and diffed by consumers.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _sql_literal_escape(value: str) -> str:
@@ -102,13 +132,14 @@ class DQMetricsObserver:
         """
         return self.id_overwrite or str(uuid4())
 
-    def get_metrics(self, check_names: list[str] | None = None) -> list[str]:
+    def get_metrics(self, checks: Sequence[str | DQCheckMetadata] | None = None) -> list[str]:
         """
         Gets the observer metrics as Spark SQL expressions.
 
         Args:
-            check_names: Optional list of check names from the applied quality rules.
-                When provided, a per-check breakdown (*check_metrics*) is included.
+            checks: Optional sequence of applied quality rules. When provided, a per-check breakdown
+                (*check_metrics*) is included. Entries may be plain check names, or *DQCheckMetadata*
+                to also report each rule's *rule_fingerprint* and *user_metadata*.
 
         Returns:
             A list of Spark SQL expressions defining the observer metrics (default, per-check, and custom).
@@ -119,13 +150,13 @@ class DQMetricsObserver:
             f"count(case when {self._warning_column_name} is not null then 1 end) as warning_row_count",
             f"count(case when {self._error_column_name} is null and {self._warning_column_name} is null then 1 end) as valid_row_count",
         ]
-        if check_names:
-            metrics.append(self._build_check_metrics_expr(check_names))
+        if checks:
+            metrics.append(self._build_check_metrics_expr(checks))
         if self.custom_metrics:
             metrics.extend(self.custom_metrics)
         return metrics
 
-    def _build_check_metrics_expr(self, check_names: list[str]) -> str:
+    def _build_check_metrics_expr(self, checks: Sequence[str | DQCheckMetadata]) -> str:
         """Build a single SQL expression that produces a per-check breakdown.
 
         Produces the canonical JSON array string directly from SQL using concat and
@@ -141,27 +172,42 @@ class DQMetricsObserver:
             primitives and arrays of primitives, but not arrays of structs or arrays
             of strings carrying struct data, so we stay in plain string territory.
 
+        *rule_fingerprint* and *user_metadata* are per-rule constants rather than aggregates, so they
+        are JSON-encoded in Python and embedded as literals — no Spark-side map or struct handling is
+        needed, which keeps the expression within the two constraints above. Both are omitted from an
+        entry when the caller did not supply them, so a narrower *from_json* schema still parses the
+        long-standing fields.
+
         Args:
-            check_names: List of check names to include in the expression.
+            checks: Sequence of checks to include, as names or *DQCheckMetadata*.
 
         Returns:
             A Spark SQL expression string aliased as *check_metrics*.
         """
         fragments: list[str] = []
-        for check_name in check_names:
-            check_name_escaped = _sql_literal_escape(check_name)
+        for check in checks:
+            metadata = DQCheckMetadata(name=check) if isinstance(check, str) else check
+            check_name_escaped = _sql_literal_escape(metadata.name)
             # JSON-encode the check name (handles embedded quotes, backslashes, control chars),
             # then escape it again for safe inclusion in a SQL string literal.
-            json_check_name_sql_esc = _sql_literal_escape(json.dumps(check_name))
+            json_check_name_sql_esc = _sql_literal_escape(json.dumps(metadata.name))
             err = self._error_column_name
             warn = self._warning_column_name
+            fingerprint_json = ""
+            if metadata.rule_fingerprint:
+                encoded = _sql_literal_escape(json.dumps(metadata.rule_fingerprint))
+                fingerprint_json = f',"rule_fingerprint":{encoded}'
+            user_metadata_json = ""
+            if metadata.user_metadata:
+                encoded = _sql_literal_escape(_compact_json(metadata.user_metadata))
+                user_metadata_json = f',"user_metadata":{encoded}'
             fragments.append(
                 f"concat("
-                f"'{{\"check_name\":{json_check_name_sql_esc},\"error_count\":',"
+                f"'{{\"check_name\":{json_check_name_sql_esc}{fingerprint_json},\"error_count\":',"
                 f"cast(count(case when exists({err}, x -> x.name = '{check_name_escaped}') then 1 end) as string),"
                 f"',\"warning_count\":',"
                 f"cast(count(case when exists({warn}, x -> x.name = '{check_name_escaped}') then 1 end) as string),"
-                f"'}}')"
+                f"'{user_metadata_json}}}')"
             )
         return f"concat('[', concat_ws(',', {', '.join(fragments)}), ']') as check_metrics"
 
