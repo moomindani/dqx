@@ -52,7 +52,7 @@ from databricks.labs.dqx.rule import (
 )
 from databricks.labs.dqx.checks_validator import ChecksValidator, ChecksValidationStatus
 from databricks.labs.dqx.schema import dq_result_schema
-from databricks.labs.dqx.metrics_observer import DQMetricsObservation, DQMetricsObserver
+from databricks.labs.dqx.metrics_observer import DQCheckMetadata, DQMetricsObservation, DQMetricsObserver
 from databricks.labs.dqx.metrics_listener import StreamingMetricsListener
 from databricks.labs.dqx.io import read_input_data, save_dataframe_as_table, get_reference_dataframes
 from databricks.labs.dqx.telemetry import telemetry_logger, log_telemetry, log_dataframe_telemetry, is_dlt_pipeline
@@ -201,8 +201,9 @@ class DQEngineCore(DQEngineCoreBase):
 
         # Duplicate check names are intentionally preserved — if two rules share a name,
         # check_metrics will report each occurrence separately so the user can spot the overlap.
-        check_names = [check.name for check in checks]
-        observed_result = self._observe_metrics(result_df, check_names)
+        # The per-rule fingerprint is what lets a consumer tell those entries apart.
+        check_metadata = _build_check_metadata(checks)
+        observed_result = self._observe_metrics(result_df, check_metadata)
 
         if isinstance(observed_result, tuple):
             observed_df, observation = observed_result
@@ -646,14 +647,14 @@ class DQEngineCore(DQEngineCoreBase):
         return result_df
 
     def _observe_metrics(
-        self, df: DataFrame, check_names: list[str] | None = None
+        self, df: DataFrame, checks: list[DQCheckMetadata] | None = None
     ) -> DataFrame | tuple[DataFrame, Observation]:
         """
         Adds Spark observable metrics to the input DataFrame.
 
         Args:
             df: Input DataFrame
-            check_names: Optional list of check names to include per-check metrics.
+            checks: Optional list of per-check metadata to include per-check metrics.
 
         Returns:
             The unmodified DataFrame with observed metrics and the corresponding Spark Observation
@@ -674,7 +675,7 @@ class DQEngineCore(DQEngineCoreBase):
             )
             return df
 
-        metric_exprs = [F.expr(m) for m in self.observer.get_metrics(check_names)]
+        metric_exprs = [F.expr(m) for m in self.observer.get_metrics(checks)]
         if not metric_exprs:
             return df
 
@@ -683,6 +684,27 @@ class DQEngineCore(DQEngineCoreBase):
             return df.observe(self.observer.id, *metric_exprs), observation
 
         return df.observe(observation, *metric_exprs), observation
+
+
+def _build_check_metadata(checks: list[DQRule]) -> list[DQCheckMetadata]:
+    """Project rules onto the per-check metadata reported in *check_metrics*.
+
+    Order is preserved (and duplicates kept) so each rule maps to its own breakdown entry.
+
+    Args:
+        checks: Applied quality rules, in expanded form.
+
+    Returns:
+        One *DQCheckMetadata* per rule.
+    """
+    return [
+        DQCheckMetadata(
+            name=check.name,
+            rule_fingerprint=check.rule_fingerprint,
+            user_metadata=check.user_metadata,
+        )
+        for check in checks
+    ]
 
 
 def _populate_batch_observation(
@@ -1892,15 +1914,16 @@ class DQEngine(DQEngineBase):
             )
             checks = storage_handler.load(storage_config)
 
-        check_names: list[str] | None = None
+        check_metadata: list[DQCheckMetadata] | None = None
         rule_set_fingerprint: str | None = None
         if checks:
             rules = deserialize_checks(checks, custom_check_functions)
-            # Duplicate check names are preserved so check_metrics reports each occurrence separately.
-            check_names = [rule.name for rule in rules]
+            # Duplicate check names are preserved so check_metrics reports each occurrence separately;
+            # the per-rule fingerprint is what lets a consumer tell those entries apart.
+            check_metadata = _build_check_metadata(rules)
             rule_set_fingerprint = compute_rule_set_fingerprint(rules)
 
-        aggregated_df = checked_df.selectExpr(*observer.get_metrics(check_names))
+        aggregated_df = checked_df.selectExpr(*observer.get_metrics(check_metadata))
         observation = self._build_metrics_observation(
             input_config=input_config,
             output_config=output_config,

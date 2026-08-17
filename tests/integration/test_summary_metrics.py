@@ -47,12 +47,31 @@ TEST_CHECKS = [
 ]
 TEST_CHECKS_RULE_SET_FINGERPRINT = compute_rule_set_fingerprint_by_metadata(TEST_CHECKS)
 TEST_OBSERVER_NAME = "test_observer"
+# Per-rule fingerprints are derived rather than hard-coded: the expectation below asserts the shape
+# and placement of the field, and pinning the hash values here would break on any fingerprinting
+# change without describing an actual regression in check_metrics.
+TEST_CHECKS_RULE_FINGERPRINTS = [rule.rule_fingerprint for rule in deserialize_checks(TEST_CHECKS)]
 # Expected check_metrics JSON value for TEST_CHECKS with standard 4-row test data
-# (row 3 has id=None → error, row 4 has name=None → warning)
+# (row 3 has id=None → error, row 4 has name=None → warning). TEST_CHECKS sets no rule-level
+# user_metadata, so that field is absent from both entries.
 TEST_CHECK_METRICS_VALUE = (
-    '[{"check_name":"id_is_not_null","error_count":1,"warning_count":0},'
-    '{"check_name":"name_is_not_null_and_not_empty","error_count":0,"warning_count":1}]'
+    '[{"check_name":"id_is_not_null",'
+    f'"rule_fingerprint":"{TEST_CHECKS_RULE_FINGERPRINTS[0]}",'
+    '"error_count":1,"warning_count":0},'
+    '{"check_name":"name_is_not_null_and_not_empty",'
+    f'"rule_fingerprint":"{TEST_CHECKS_RULE_FINGERPRINTS[1]}",'
+    '"error_count":0,"warning_count":1}]'
 )
+
+
+def _without_fingerprints(entries: list[dict]) -> list[dict]:
+    """Drop *rule_fingerprint* so a test can assert only the fields it is about.
+
+    Every rule applied through the engine carries a fingerprint, but re-deriving the hashes in each
+    test would obscure what that test checks. Fingerprint presence and placement has its own
+    coverage in *test_observer_check_metrics_rule_metadata*.
+    """
+    return [{key: value for key, value in entry.items() if key != "rule_fingerprint"} for entry in entries]
 
 
 def test_observer_custom_column_names(ws, spark):
@@ -2998,10 +3017,7 @@ def test_observer_check_metrics(ws, spark, apply_checks_method):
 
     # Per-check metrics as compact JSON
     check_metrics = json.loads(actual_metrics["check_metrics"])
-    assert check_metrics == [
-        {"check_name": "id_is_not_null", "error_count": 1, "warning_count": 0},
-        {"check_name": "name_is_not_null_and_not_empty", "error_count": 0, "warning_count": 1},
-    ]
+    assert check_metrics == json.loads(TEST_CHECK_METRICS_VALUE)
 
 
 @pytest.mark.parametrize(
@@ -3044,7 +3060,65 @@ def test_observer_check_metrics_name_round_trip(ws, spark, check_name):
 
     # json.loads must not raise, and the name must come back byte-for-byte.
     check_metrics = json.loads(observation.get["check_metrics"])
-    assert check_metrics == [{"check_name": check_name, "error_count": 1, "warning_count": 0}]
+    assert _without_fingerprints(check_metrics) == [{"check_name": check_name, "error_count": 1, "warning_count": 0}]
+
+
+@pytest.mark.parametrize("apply_checks_method", [DQEngine.apply_checks, DQEngine.apply_checks_by_metadata])
+def test_observer_check_metrics_rule_metadata(ws, spark, apply_checks_method):
+    """Test that check_metrics carries each rule's fingerprint and rule-level user_metadata.
+
+    Both let a consumer attribute a failing check to its owner without joining back to the check
+    definitions, and the fingerprint keeps entries distinguishable when two rules share a name —
+    which is exactly the case asserted here.
+    """
+    checks = [
+        {
+            "name": "shared_name",
+            "criticality": "error",
+            "check": {"function": "is_not_null", "arguments": {"column": "id"}},
+            "user_metadata": {"owner": "data-eng", "team": "ingest"},
+        },
+        {
+            "name": "shared_name",
+            "criticality": "warn",
+            "check": {"function": "is_not_null_and_not_empty", "arguments": {"column": "name"}},
+        },
+    ]
+    expected_fingerprints = [rule.rule_fingerprint for rule in deserialize_checks(checks)]
+
+    observer = DQMetricsObserver(name="test_observer")
+    dq_engine = DQEngine(workspace_client=ws, spark=spark, observer=observer, extra_params=EXTRA_PARAMS)
+
+    test_df = spark.createDataFrame([[1, "Alice", 30, 50000], [None, None, 35, 60000]], TEST_SCHEMA)
+
+    if apply_checks_method == DQEngine.apply_checks:
+        checked_df, observation = dq_engine.apply_checks(test_df, deserialize_checks(checks))
+    elif apply_checks_method == DQEngine.apply_checks_by_metadata:
+        checked_df, observation = dq_engine.apply_checks_by_metadata(test_df, checks)
+    else:
+        raise ValueError("Invalid 'apply_checks_method' used for testing observable metrics.")
+
+    checked_df.count()  # Trigger an action to get the metrics
+    check_metrics = json.loads(observation.get["check_metrics"])
+
+    # The two entries share a name, so the fingerprint is the only thing telling them apart. The
+    # second rule sets no user_metadata, so that field is absent from its entry rather than null.
+    assert check_metrics == [
+        {
+            "check_name": "shared_name",
+            "rule_fingerprint": expected_fingerprints[0],
+            "error_count": 1,
+            "warning_count": 1,
+            "user_metadata": {"owner": "data-eng", "team": "ingest"},
+        },
+        {
+            "check_name": "shared_name",
+            "rule_fingerprint": expected_fingerprints[1],
+            "error_count": 1,
+            "warning_count": 1,
+        },
+    ]
+    assert expected_fingerprints[0] != expected_fingerprints[1]
 
 
 @pytest.mark.parametrize("apply_checks_method", [DQEngine.apply_checks, DQEngine.apply_checks_by_metadata])

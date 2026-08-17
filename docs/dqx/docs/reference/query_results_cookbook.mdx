@@ -376,7 +376,7 @@ The `check_metrics` field in the summary table already contains a per-check brea
       cm.error_count,
       cm.warning_count
     FROM catalog.schema.summary_metrics
-    LATERAL VIEW explode(from_json(metric_value, 'array<struct<check_name:string,error_count:bigint,warning_count:bigint>>')) AS cm
+    LATERAL VIEW explode(from_json(metric_value, 'array<struct<check_name:string,rule_fingerprint:string,error_count:bigint,warning_count:bigint,user_metadata:map<string,string>>>')) AS cm
     WHERE run_id = '<run_id>'
       AND metric_name = 'check_metrics'
       AND (cm.error_count > 0 OR cm.warning_count > 0);
@@ -384,13 +384,15 @@ The `check_metrics` field in the summary table already contains a per-check brea
   </TabItem>
   <TabItem value="Python" label="Python">
     ```python
-    from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
+    from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType, MapType
     import pyspark.sql.functions as F
 
     check_metrics_schema = ArrayType(StructType([
       StructField("check_name", StringType()),
+      StructField("rule_fingerprint", StringType()),
       StructField("error_count", LongType()),
       StructField("warning_count", LongType()),
+      StructField("user_metadata", MapType(StringType(), StringType())),
     ]))
 
     failed_checks_df = (
@@ -699,7 +701,7 @@ This extends Recipe 7. Instead of the current error rate, you want the *first* r
       MIN(sm.run_time) AS first_failure_time,
       MIN_BY(sm.run_id, sm.run_time) AS first_failure_run_id
     FROM catalog.schema.summary_metrics sm
-    LATERAL VIEW explode(from_json(metric_value, 'array<struct<check_name:string,error_count:bigint,warning_count:bigint>>')) AS cm
+    LATERAL VIEW explode(from_json(metric_value, 'array<struct<check_name:string,rule_fingerprint:string,error_count:bigint,warning_count:bigint,user_metadata:map<string,string>>>')) AS cm
     WHERE metric_name = 'check_metrics'
       AND cm.error_count > 0
     GROUP BY cm.check_name
@@ -708,13 +710,15 @@ This extends Recipe 7. Instead of the current error rate, you want the *first* r
   </TabItem>
   <TabItem value="Python" label="Python">
     ```python
-    from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType
+    from pyspark.sql.types import ArrayType, StructType, StructField, StringType, LongType, MapType
     import pyspark.sql.functions as F
 
     check_metrics_schema = ArrayType(StructType([
       StructField("check_name", StringType()),
+      StructField("rule_fingerprint", StringType()),
       StructField("error_count", LongType()),
       StructField("warning_count", LongType()),
+      StructField("user_metadata", MapType(StringType(), StringType())),
     ]))
 
     first_failures_df = (

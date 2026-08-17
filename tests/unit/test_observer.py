@@ -2,7 +2,7 @@
 
 from pyspark.sql import Observation
 from pyspark.sql.connect.observation import Observation as SparkConnectObservation
-from databricks.labs.dqx.metrics_observer import DQMetricsObserver
+from databricks.labs.dqx.metrics_observer import DQCheckMetadata, DQMetricsObserver
 from databricks.labs.dqx.reporting_columns import DefaultColumnNames
 
 
@@ -114,6 +114,71 @@ def test_check_metrics_expr_escapes_single_quotes_with_backslash():
     assert "it\\'s_valid" in expr
     assert "it''s_valid" not in expr
     assert "''" not in expr
+
+
+def test_check_metrics_omits_rule_metadata_when_given_names():
+    """Bare check names must produce exactly the long-standing fields.
+
+    Callers passing names get no rule_fingerprint or user_metadata, so a narrower from_json schema
+    keeps parsing unchanged.
+    """
+    expr = DQMetricsObserver().get_metrics(["c"])[-1]
+
+    assert "rule_fingerprint" not in expr
+    assert "user_metadata" not in expr
+
+
+def test_check_metrics_includes_rule_fingerprint_and_user_metadata():
+    """Both fields are emitted as literals, since they are per-rule constants not aggregates."""
+    check = DQCheckMetadata(
+        name="c",
+        rule_fingerprint="abc123",
+        user_metadata={"team": "ingest", "owner": "data-eng"},
+    )
+
+    expr = DQMetricsObserver().get_metrics([check])[-1]
+
+    assert '"rule_fingerprint":"abc123"' in expr
+    # Keys are sorted and whitespace stripped so the emitted metric is deterministic.
+    assert '"user_metadata":{"owner":"data-eng","team":"ingest"}' in expr
+
+
+def test_check_metrics_omits_unset_rule_metadata_fields():
+    """Each field is independently optional — an entry carries only what the caller supplied."""
+    fingerprint_only = DQMetricsObserver().get_metrics([DQCheckMetadata(name="c", rule_fingerprint="abc")])[-1]
+    assert '"rule_fingerprint":"abc"' in fingerprint_only
+    assert "user_metadata" not in fingerprint_only
+
+    metadata_only = DQMetricsObserver().get_metrics([DQCheckMetadata(name="c", user_metadata={"a": "b"})])[-1]
+    assert "rule_fingerprint" not in metadata_only
+    assert '"user_metadata":{"a":"b"}' in metadata_only
+
+    # An empty dict is treated as unset rather than emitted as {}.
+    empty_metadata = DQMetricsObserver().get_metrics([DQCheckMetadata(name="c", user_metadata={})])[-1]
+    assert "user_metadata" not in empty_metadata
+
+
+def test_check_metrics_escapes_user_metadata_values():
+    """User metadata is user-supplied, so it goes through the same SQL literal escaping."""
+    check = DQCheckMetadata(name="c", user_metadata={"note": "it's \"quoted\" \\ odd"})
+
+    expr = DQMetricsObserver().get_metrics([check])[-1]
+
+    assert "''" not in expr
+    assert "it\\'s" in expr
+
+
+def test_check_metrics_distinguishes_duplicate_names_by_fingerprint():
+    """Two rules sharing a name stay separable, which is the point of including the fingerprint."""
+    checks = [
+        DQCheckMetadata(name="dup", rule_fingerprint="fp_one"),
+        DQCheckMetadata(name="dup", rule_fingerprint="fp_two"),
+    ]
+
+    expr = DQMetricsObserver().get_metrics(checks)[-1]
+
+    assert '"rule_fingerprint":"fp_one"' in expr
+    assert '"rule_fingerprint":"fp_two"' in expr
 
 
 def test_check_metrics_expr_escapes_backslashes():
